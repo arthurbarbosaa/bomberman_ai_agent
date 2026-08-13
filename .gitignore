@@ -1,0 +1,10 @@
+# Virtual environments
+venv/
+.venv/
+
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+
+# Generated outputs
+outputs/
