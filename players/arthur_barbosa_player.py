@@ -12,8 +12,9 @@ Cada decisão segue cinco etapas:
    espaço (célula, tempo, recarga de movimento) verifica se ainda existe uma
    rota que sobrevive até uma célula definitivamente segura.
 4. Utilidade: entre as ações seguras, escolhe a que mais aproxima de objetivos
-   (itens, caixas, oponentes encurralados, centro da arena), com desconto pela
-   distância.
+   (itens, caixas que bloqueiam o caminho, centro da arena), com desconto pela
+   distância. A estratégia é posicional: ir cedo para a célula que sobrevive ao
+   último anel e só usar bombas para abrir caminho até ela.
 5. Maldição: aprende a permutação de comandos comparando a ação pretendida e a
    ação efetiva do tick anterior e escolhe o comando que produz a ação desejada.
 
@@ -40,6 +41,8 @@ OPP_REACH = 3  # alcance dos oponentes considerado na fuga robusta
 THREAT_PENALTY = 60.0  # posição que uma bomba nova de um oponente fecharia
 DEAD_END_RADIUS = 6
 DEAD_END_PENALTY = 50.0
+CURSE_EXPLORATION_BONUS = 30.0
+FINAL_TRAP_PENALTY = 200.0
 RING_WINDOW = 32  # anéis que fecham depois disso ficam a cargo dos objetivos
 
 
@@ -49,10 +52,10 @@ class View:
     __slots__ = (
         "tick", "board", "width", "height", "pos", "me", "nm", "delay",
         "can_bomb", "bomb_range", "bombs", "opps", "opp_cells", "cursed_opps",
-        "items", "flames", "danger", "max_end", "bomb_block", "horizon",
+        "items", "flames", "danger", "max_end", "bomb_block",
         "shrink_margin", "next_shrink", "shrink_active", "cursed",
         "final_cells", "final_step", "endgame", "threats", "_threat_base",
-        "_cached_targets", "_dist_cache", "_regions", "_avoid",
+        "_cached_targets", "_dist_cache", "_regions", "_avoid", "_center_reachable",
     )
 
 
@@ -101,8 +104,15 @@ class Agent:
         for intended in ACTIONS:
             outcomes = self._possible_outcomes(intended, view.cursed)
             values = [scores[effective] for effective in outcomes]
-            # Sob maldição, primeiro garante o pior caso; depois a média.
-            key = (min(values), sum(values) / len(values), self.rng.random())
+            # Sob maldição, descarta comandos que podem ser mortais e escolhe pela
+            # média (resultados ruins, mas não mortais, saturam em -60). Testar um
+            # comando desconhecido vale um bônus: descobrir a permutação ajuda em
+            # todos os ticks seguintes, em vez de repetir para sempre um inofensivo.
+            worst = min(values)
+            mean = sum(max(v, -60.0) for v in values) / len(values)
+            if view.cursed and intended not in self.curse_map:
+                mean += CURSE_EXPLORATION_BONUS
+            key = (worst > -900.0, mean, worst, self.rng.random())
             if best_key is None or key > best_key:
                 best_action, best_key = intended, key
         return best_action
@@ -158,6 +168,9 @@ class Agent:
         caution = self._caution(view)
         if action == "BOMB" and view.can_bomb:
             value = self._bomb_value(view.pos, view)
+            # Quem segura a célula final no fim de jogo não a abandona por uma bomba.
+            if view.endgame and view.pos in view.final_cells:
+                return -100.0 + value
             if self._spoils_final(view):
                 return -100.0 + value
             if goals < 2 or robust == 0:
@@ -329,15 +342,12 @@ class Agent:
         if view.next_shrink is not None:
             remaining = final_margin - (view.shrink_margin + 1)
             view.final_step = view.next_shrink + remaining * self.shrink_interval
-        view.endgame = (
-            view.shrink_active and view.final_step is not None and view.final_step <= 120
-        )
+        view.endgame = view.final_step is not None
 
         danger, bomb_block = self._timeline(view, view.bombs)
         view.danger = danger
         view.bomb_block = bomb_block
         view.max_end = self._max_end(danger)
-        view.horizon = self._horizon(view.max_end)
         return view
 
     def _blast(self, board, origin, blast_range) -> list[tuple[int, int]]:
@@ -568,7 +578,9 @@ class Agent:
                 nxt = (cell[0] + dx, cell[1] + dy)
                 if nxt not in dist and self._passable(nxt, view):
                     dist[nxt] = d + 1
-                    queue.append(nxt)
+                    # Dá para chegar até um oponente, mas não atravessá-lo.
+                    if nxt not in view.opp_cells:
+                        queue.append(nxt)
         return dist
 
     def _targets(self, view: View) -> list[tuple[tuple[int, int], float]]:
@@ -611,7 +623,11 @@ class Agent:
 
         if view.endgame:
             for cell in view.final_cells:
-                targets.append((cell, 150.0))
+                if cell in view.max_end:
+                    continue  # vai explodir: primeiro fugir, voltar depois das chamas
+                # Ocupada por um oponente, a célula final quase não vale: só
+                # volta a atrair quando ele sair.
+                targets.append((cell, 15.0 if cell in view.opp_cells else 150.0))
 
         # Fechamento da arena: entrar na região que continuará aberta.
         if view.next_shrink is not None:
@@ -620,7 +636,7 @@ class Agent:
                 safe_depth = view.shrink_margin + 2
                 value = 60.0 if view.next_shrink <= 60 else 30.0
                 for (x, y), size in self._safe_regions(view).items():
-                    if size >= self._needed_region(view):
+                    if size >= self._needed_region(view) and (x, y) not in view.max_end:
                         # Quanto mais fundo, mais fechamentos a célula aguenta.
                         depth = self._depth(view, (x, y))
                         targets.append(((x, y), value + 8.0 * (depth - safe_depth)))
@@ -671,12 +687,21 @@ class Agent:
             # Ponta de beco: um oponente por perto pode fechar a única saída.
             near = min((dist.get(opp, INF) for opp in view.opps), default=INF)
             if near <= DEAD_END_RADIUS:
-                local -= DEAD_END_PENALTY * self._caution(view)
+                penalty = DEAD_END_PENALTY
+                if intended_pos in view.final_cells:
+                    # Célula final com uma só saída: segurá-la com um oponente
+                    # por perto é pedir para ser encurralado.
+                    penalty += FINAL_TRAP_PENALTY
+                local -= penalty * self._caution(view)
         if not view.cursed:
             for ox, oy in view.cursed_opps:
                 if abs(ox - intended_pos[0]) + abs(oy - intended_pos[1]) <= 1:
                     local -= 15.0
-        if view.endgame and intended_pos in view.final_cells:
+        if (
+            view.endgame
+            and intended_pos in view.final_cells
+            and intended_pos not in view.max_end
+        ):
             local += 40.0  # segurar a célula final
         if view.items.get(intended_pos) == "CURSE":
             local -= 40.0
@@ -734,54 +759,24 @@ class Agent:
         flames_end = self.fuse + self.flame_len
         return flames_end >= view.final_step - 2
 
-    def _bomb_value(self, cell, view: View) -> float:
-        cells = self._blast(view.board, cell, view.bomb_range)
-        value = 0.0
-        # Expulsar quem ocupa a célula final, a tempo de tomá-la depois.
-        if view.endgame and view.final_step - (self.fuse + self.flame_len) >= 3:
-            for opp in view.opps:
-                if opp in view.final_cells and opp in cells:
-                    value += 60.0
-        for x, y in cells:
-            if view.board[y][x] == "+" and (x, y) not in view.max_end:
-                value += 6.0
-            kind = view.items.get((x, y))
-            if kind and kind != "CURSE":
-                value -= 8.0
-        blast = set(cells)
-        for opp in view.opps:
-            if opp in blast:
-                value += 10.0
-                room = self._opponent_room(opp, blast, view)
-                if room == 0:
-                    value += 80.0
-                elif room <= 2:
-                    value += 20.0
-        return value
+    def _center_reachable(self, view: View) -> bool:
+        cached = getattr(view, "_center_reachable", None)
+        if cached is None:
+            dist = self._distances(view.pos, view)
+            cached = any(cell in dist for cell in view.final_cells)
+            view._center_reachable = cached  # type: ignore[attr-defined]
+        return cached
 
-    def _opponent_room(self, opp, blast, view: View, depth: int = 6) -> int:
-        """Quantas células fora do alcance o oponente consegue alcançar."""
-        seen = {opp}
-        queue = deque([(opp, 0)])
-        room = 0
-        while queue:
-            cell, d = queue.popleft()
-            if cell not in blast and cell not in view.max_end:
-                room += 1
-                if room > 2:
-                    return room
-            if d >= depth:
-                continue
-            for dx, dy in MOVES.values():
-                nxt = (cell[0] + dx, cell[1] + dy)
-                if nxt in seen or nxt == view.pos:
-                    continue
-                x, y = nxt
-                if view.board[y][x] != "." or nxt in view.bomb_block:
-                    continue
-                seen.add(nxt)
-                queue.append((nxt, d + 1))
-        return room
+    def _bomb_value(self, cell, view: View) -> float:
+        """Quase pacifista: só vale explodir caixas enquanto o centro está
+        inacessível; depois disso, nenhuma bomba compensa o risco."""
+        if self._center_reachable(view):
+            return 0.0
+        return sum(
+            6.0
+            for x, y in self._blast(view.board, cell, view.bomb_range)
+            if view.board[y][x] == "+" and (x, y) not in view.max_end
+        )
 
     def _static_escape(self, origin, view: View, depth: int = 6) -> bool:
         blast = set(self._blast(view.board, origin, view.bomb_range))
